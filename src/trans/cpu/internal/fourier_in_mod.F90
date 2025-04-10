@@ -9,8 +9,12 @@
 !
 
 MODULE FOURIER_IN_MOD
+INTERFACE FOURIER_IN
+   MODULE PROCEDURE FOURIER_IN_1D !inplace
+   MODULE PROCEDURE FOURIER_IN_2D !no in_place
+END INTERFACE
 CONTAINS
-SUBROUTINE FOURIER_IN(PREEL, KFIELDS, KGL)
+SUBROUTINE FOURIER_IN_2D(PREEL, KFIELDS, KGL)
 
 !**** *FOURIER_IN* - Copy fourier data from buffer to local array
 
@@ -46,7 +50,7 @@ USE TPM_GEOMETRY, ONLY : G
 
 IMPLICIT NONE
 
-REAL(KIND=JPRB),    INTENT(OUT) :: PREEL(:,:)
+REAL(KIND=JPRB),    INTENT(OUT), CONTIGUOUS :: PREEL(:,:)
 INTEGER(KIND=JPIM), INTENT(IN)  :: KFIELDS
 INTEGER(KIND=JPIM), INTENT(IN)  :: KGL
 
@@ -78,5 +82,77 @@ ENDDO
 
 !     ------------------------------------------------------------------
 
-END SUBROUTINE FOURIER_IN
+END SUBROUTINE FOURIER_IN_2D
+
+SUBROUTINE FOURIER_IN_1D(PREEL, KFIELDS, KGL, JF)
+
+!**** *FOURIER_IN* - Copy fourier data from buffer to local array
+
+!     Purpose.
+!     --------
+!        Routine for copying fourier data from buffer to local array
+
+!**   Interface.
+!     ----------
+!     CALL FOURIER_IN(...)
+
+!     Explicit arguments :  PREEL - local fourier/GP vector
+!     --------------------  KFIELDS - number of fields
+!                           KGL - local index of latitude we are currently on
+!
+!     Externals.  None.
+!     ----------
+
+!     Author.
+!     -------
+!        Mats Hamrud *ECMWF*
+
+!     Modifications.
+!     --------------
+!        Original : 2000-04-01
+
+!     ------------------------------------------------------------------
+
+USE PARKIND1,     ONLY : JPIM, JPRB
+USE TPM_DISTR,    ONLY : D, MYSETW
+USE TPM_TRANS,    ONLY : FOUBUF
+USE TPM_GEOMETRY, ONLY : G
+
+IMPLICIT NONE
+
+REAL(KIND=JPRB),    INTENT(OUT), CONTIGUOUS :: PREEL(:)
+INTEGER(KIND=JPIM), INTENT(IN)  :: KFIELDS
+INTEGER(KIND=JPIM), INTENT(IN)  :: KGL
+INTEGER(KIND=JPIM), INTENT(IN)  :: JF
+
+INTEGER(KIND=JPIM) :: JM, IGLG, IPROC, IR, II, ISTA
+
+!     ------------------------------------------------------------------
+
+! Determine global latitude index corresponding to local latitude index KGL
+IGLG = D%NPTRLS(MYSETW) + KGL - 1
+
+! Loop over all zonal wavenumbers relevant for this latitude
+
+
+DO JM = 0, G%NMEN(IGLG)
+   ! Get the member of the W-set responsible for this zonal wavenumber in the "m" representation
+   IPROC = D%NPROCM(JM)
+
+   ! Compute offset in FFT work array PREEL corresponding to wavenumber JM and latitude KGL
+   IR = 2 * JM + 1 + D%NSTAGTF(KGL)
+   II = 2 * JM + 2 + D%NSTAGTF(KGL)
+
+   ! Compute offset for extraction of the fields from the m-to-l transposition buffer, FOUBUF
+   ISTA = (D%NSTAGT0B(D%MSTABF(IPROC)) + D%NPNTGTB0(JM,KGL)) * 2 * KFIELDS
+
+   ! Copy all fields from m-to-l transposition buffer to FFT work array
+   PREEL(IR) = FOUBUF(ISTA+2*JF-1)
+   PREEL(II) = FOUBUF(ISTA+2*JF)
+END DO
+
+!     ------------------------------------------------------------------
+
+END SUBROUTINE FOURIER_IN_1D
+
 END MODULE FOURIER_IN_MOD

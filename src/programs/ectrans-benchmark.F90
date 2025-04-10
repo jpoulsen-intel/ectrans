@@ -53,6 +53,7 @@ use yomgstats, only: jpmaxstat, gstats_lstats => lstats
 use yomhook, only : dr_hook_init
 
 implicit none
+#include "trans_end.h"
 
 ! Number of points in top/bottom latitudes
 integer(kind=jpim), parameter :: min_octa_points = 20
@@ -109,9 +110,9 @@ real(kind=jprb), pointer :: zgp2 (:,:,:) ! Single level fields at t and t-dt
 
 ! Spectral space data structures
 real(kind=jprb), allocatable, target PINNED_TAG :: sp3d(:,:,:)
-real(kind=jprb), pointer :: zspvor(:,:) => null()
-real(kind=jprb), pointer :: zspdiv(:,:) => null()
-real(kind=jprb), pointer :: zspsc3a(:,:,:) => null()
+real(kind=jprb), pointer, contiguous :: zspvor(:,:) => null()
+real(kind=jprb), pointer, contiguous :: zspdiv(:,:) => null()
+real(kind=jprb), pointer, contiguous :: zspsc3a(:,:,:) => null()
 real(kind=jprb), allocatable PINNED_TAG :: zspsc2(:,:)
 
 logical :: lstack = .false. ! Output stack info
@@ -131,6 +132,7 @@ logical :: lsyncstats = .false.
 logical :: lstatscpu = .false.
 logical :: lstats_mem = .false.
 logical :: lxml_stats = .false.
+logical :: ladjoint = .false. ! test adjoint init/finalization interface
 logical :: lvordiv = .false.
 logical :: lscders = .false.
 logical :: luvders = .false.
@@ -210,6 +212,8 @@ character(len=16) :: cgrid = ''
 
 integer(kind=jpim) :: ierr
 
+real(kind=jprb), allocatable :: global_field(:,:)
+
 !===================================================================================================
 
 #include "setup_trans0.h"
@@ -217,6 +221,7 @@ integer(kind=jpim) :: ierr
 #include "inv_trans.h"
 #include "dir_trans.h"
 #include "trans_inq.h"
+#include "gath_grid.h"
 #include "specnorm.h"
 #include "abor1.intfb.h"
 #include "gstats_setup.intfb.h"
@@ -228,7 +233,8 @@ luse_mpi = detect_mpirun()
 
 ! Setup
 call get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, nlev, lvordiv, lscders, luvders, &
-  & luseflt, nopt_mem_tr, nproma, verbosity, ldump_values, lprint_norms, lmeminfo, nprtrv, nprtrw, ncheck)
+  & luseflt, nopt_mem_tr, nproma, verbosity, ldump_values, lprint_norms, lmeminfo, nprtrv, nprtrw, ncheck, &
+    ladjoint)
 if (cgrid == '') cgrid = cubic_octahedral_gaussian_grid(nsmax)
 call parse_grid(cgrid, ndgl, nloen)
 nflevg = nlev
@@ -576,7 +582,7 @@ ztinit = (timef() - ztinit)/1000.0_jprd
 if (verbosity >= 0 .and. myproc == 1) then
   write(nout,'(" ")')
   write(nout,'(a,i0,a,f9.2,a)') "ectrans_benchmark initialisation, on ",nproc,&
-                                & " tasks, took",ztinit," sec"
+                                & " tasks, took ",ztinit," sec"
   write(nout,'(" ")')
 endif
 
@@ -652,12 +658,17 @@ do jstep = 1, iters+iters_warmup
   ! While in grid point space, dump the values to disk, for debugging only
   !=================================================================================================
 
-  if (ldump_values) then
-    ! dump a field to a binary file
-    call dump_gridpoint_field(jstep, myproc, nproma, ngpblks, zgp2(:,1,:),         'S', noutdump)
-    call dump_gridpoint_field(jstep, myproc, nproma, ngpblks, zgpuv(:,nflevg,1,:), 'U', noutdump)
-    call dump_gridpoint_field(jstep, myproc, nproma, ngpblks, zgpuv(:,nflevg,2,:), 'V', noutdump)
-    call dump_gridpoint_field(jstep, myproc, nproma, ngpblks, zgp3a(:,nflevg,1,:), 'T', noutdump)
+  if (ldump_values .and. mod(jstep,10) == 1) then
+    if (myproc == 1) then
+      allocate(global_field(ngptotg,1))
+    endif
+    call dump_gridpoint_field(jstep, myproc, nproma, global_field, zgp2(:,1:1,:), 's', noutdump)
+    call dump_gridpoint_field(jstep, myproc, nproma, global_field, zgpuv(:,nflevg:nflevg,1,:), 'u', noutdump)
+    call dump_gridpoint_field(jstep, myproc, nproma, global_field, zgpuv(:,nflevg:nflevg,2,:), 'v', noutdump)
+    call dump_gridpoint_field(jstep, myproc, nproma, global_field, zgp3a(:,nflevg:nflevg,1,:), 't', noutdump)
+    if (myproc == 1) then
+      deallocate(global_field)
+    endif
   endif
 
   !=================================================================================================
@@ -954,6 +965,8 @@ if (lmeminfo) then
       & kcall=1)
 endif
 
+call trans_end('FINAL') ! cleanup
+
 !===================================================================================================
 ! Finalize MPI
 !===================================================================================================
@@ -1060,7 +1073,7 @@ end subroutine
 
 subroutine get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, nlev, lvordiv, lscders, luvders, &
   &                                   luseflt, nopt_mem_tr, nproma, verbosity, ldump_values, lprint_norms, &
-  &                                   lmeminfo, nprtrv, nprtrw, ncheck)
+  &                                   lmeminfo, nprtrv, nprtrw, ncheck, ladjoint)
 
   integer, intent(inout) :: nsmax           ! Spectral truncation
   character(len=16), intent(inout) :: cgrid ! Spectral truncation
@@ -1083,11 +1096,12 @@ subroutine get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, n
   integer, intent(inout) :: nprtrw          ! Size of W set (spectral decomposition)
   integer, intent(inout) :: ncheck          ! The multiplier of the machine epsilon used as a
                                             ! tolerance for correctness checking
+  logical, intent(inout) :: ladjoint        ! test adjoint interface init/finalization (no calls)
 
   character(len=128) :: carg          ! Storage variable for command line arguments
   integer            :: iarg = 1      ! Argument index
 
-#ifdef ACCGPU
+#ifdef _OPENACC
   !$acc init
 #endif
 
@@ -1136,6 +1150,7 @@ subroutine get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, n
       case('--nprtrv'); nprtrv = get_int_value('--nprtrv', iarg)
       case('--nprtrw'); nprtrw = get_int_value('--nprtrw', iarg)
       case('-c', '--check'); ncheck = get_int_value('-c', iarg)
+      case('--adjoint'); ladjoint = .True.
       case default
         call parsing_failed("Unrecognised argument: " // trim(carg))
 
@@ -1349,27 +1364,32 @@ end subroutine initialize_2d_spectral_field
 
 !===================================================================================================
 
-subroutine dump_gridpoint_field(jstep, myproc, nproma, ngpblks, fld, fldchar, noutdump)
+subroutine dump_gridpoint_field(jstep, myproc, nproma, gfld, fld, fldchar, noutdump)
 
   ! Dump a 2d field to a binary file.
 
   integer(kind=jpim), intent(in) :: jstep ! Time step, used for naming file
   integer(kind=jpim), intent(in) :: myproc ! MPI rank, used for naming file
   integer(kind=jpim), intent(in) :: nproma ! Size of nproma
-  integer(kind=jpim), intent(in) :: ngpblks ! Number of nproma blocks
-  real(kind=jprb)   , intent(in) :: fld(nproma,ngpblks) ! 2D field
+  real(kind=jprb)   , intent(inout) :: gfld(:,:) ! 2d global field
+  real(kind=jprb)   , intent(in) :: fld(:,:,:) ! 3d local field
   character         , intent(in) :: fldchar ! Single character field identifier
   integer(kind=jpim), intent(in) :: noutdump ! Tnit number for output file
 
-  character(len=14) :: filename = "x.xxx.xxxx.dat"
+  character(len=10) :: filename = "x.xxxx.dat"
 
-  write(filename(1:1),'(a1)') fldchar
-  write(filename(3:5),'(i3.3)') jstep
-  write(filename(7:10),'(i4.4)') myproc
-
-  open(noutdump, file=filename, form="unformatted")
-  write(noutdump) reshape(fld, (/ nproma*ngpblks /))
-  close(noutdump)
+  if (myproc == 1) then
+    write(filename(1:1),'(a1)') fldchar
+    write(filename(3:6),'(i4.4)') jstep
+    open(noutdump,file=filename,form='unformatted')
+  endif
+  do ilev=1,size(fld,2)
+    call gath_grid(gfld(:,:),nproma,1,(/1/),1,fld(:,ilev:ilev,:))
+    if (myproc == 1) write(unit=noutdump) gfld(:,1)
+  enddo
+  if (myproc == 1) then
+    close(noutdump)
+  endif
 
 end subroutine dump_gridpoint_field
 
